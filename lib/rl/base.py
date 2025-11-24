@@ -1,4 +1,5 @@
 import os
+import wandb
 
 from rl_games.common import vecenv
 
@@ -498,6 +499,24 @@ class MyA2CBase(BaseAlgorithm):
         self.writer.add_scalar("info/kl", torch_ext.mean_list(kls).item(), frame)
         self.writer.add_scalar("info/epochs", epoch_num, frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
+
+        # wandb.log({
+        #     "performance/step_inference_rl_update_fps": curr_frames / scaled_time,
+        #     "performance/step_inference_fps": curr_frames / scaled_play_time,
+        #     "performance/step_fps": curr_frames / step_time,
+        #     "performance/rl_update_time": update_time,
+        #     "performance/step_inference_time": play_time,
+        #     "performance/step_time": step_time,
+        #     "losses/a_loss": torch_ext.mean_list(a_losses).item(),
+        #     "losses/c_loss": torch_ext.mean_list(c_losses).item(),
+        #     "losses/entropy": torch_ext.mean_list(entropies).item(),
+        #     "info/last_lr": last_lr * lr_mul,
+        #     "info/lr_mul": lr_mul,
+        #     "info/e_clip": self.e_clip * lr_mul,
+        #     "info/kl": torch_ext.mean_list(kls).item(),
+        #     "info/epochs": epoch_num,
+        #     "frame": frame,
+        # })
 
     def set_eval(self):
         self.model.eval()
@@ -1288,6 +1307,7 @@ class MyContinuousA2CBase(MyA2CBase):
         rep_count = 0
         self.obs = self.env_reset()
         self.curr_frames = self.batch_size_envs
+        self.step_ct = 0
 
         if self.multi_gpu:
             print("====================broadcasting parameters")
@@ -1316,6 +1336,7 @@ class MyContinuousA2CBase(MyA2CBase):
             # cleaning memory to optimize space
             self.dataset.update_values_dict(None)
             should_exit = False
+            self.step_ct += self.curr_frames
 
             if self.global_rank == 0:
                 self.diagnostics.epoch(self, current_epoch=epoch_num)
@@ -1371,6 +1392,13 @@ class MyContinuousA2CBase(MyA2CBase):
                     self.writer.add_scalar("success_rate/step", mean_success_rate, frame)
                     self.writer.add_scalar("success_rate/iter", mean_success_rate, epoch_num)
                     self.writer.add_scalar("success_rate/time", mean_success_rate, total_time)
+                    wandb.log(
+                        {
+                            "success_rate": mean_success_rate,
+                        },
+                        step=self.step_ct
+                    )
+
 
                 mean_fail_rate = None
                 if self.game_fails.current_size > 0:
@@ -1378,6 +1406,20 @@ class MyContinuousA2CBase(MyA2CBase):
                     self.writer.add_scalar("fail_rate/step", mean_fail_rate, frame)
                     self.writer.add_scalar("fail_rate/iter", mean_fail_rate, epoch_num)
                     self.writer.add_scalar("fail_rate/time", mean_fail_rate, total_time)
+                    # wandb.log({
+                    #     "fail_rate/step": mean_fail_rate,
+                    #     "fail_rate/iter": mean_fail_rate,
+                    #     "fail_rate/time": mean_fail_rate,
+                    #     "train/frame": frame,
+                    #     "train/epoch": epoch_num,
+                    #     "train/total_time": total_time
+                    # })
+                    wandb.log(
+                        {
+                            "fail_rate": mean_fail_rate,
+                        },
+                        step=self.step_ct
+                    )
 
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
@@ -1409,6 +1451,24 @@ class MyContinuousA2CBase(MyA2CBase):
                             "shaped_" + rewards_name + "/time".format(i),
                             mean_shaped_rewards[i],
                             total_time,
+                        )
+
+                        # wandb.log({
+                        #     f"{rewards_name}/step": mean_rewards[i],
+                        #     f"{rewards_name}/iter": mean_rewards[i],
+                        #     f"{rewards_name}/time": mean_rewards[i],
+                        #     f"shaped_{rewards_name}/step": mean_shaped_rewards[i],
+                        #     f"shaped_{rewards_name}/iter": mean_shaped_rewards[i],
+                        #     f"shaped_{rewards_name}/time": mean_shaped_rewards[i],
+                        #     "train/frame": frame,
+                        #     "train/epoch": epoch_num,
+                        #     "train/total_time": total_time,
+                        # })
+                        wandb.log(
+                            {
+                                f"{rewards_name}": mean_rewards[i],
+                            },
+                            step=self.step_ct
                         )
 
                     game_reward_dict = {k: v.get_mean() for k, v in self.game_reward_dict.items()}

@@ -35,7 +35,7 @@ class WandbAlgoObserver(AlgoObserver):
                 entity=cfg.wandb_entity,
                 group=cfg.wandb_group,
                 tags=cfg.wandb_tags,
-                sync_tensorboard=True,
+                sync_tensorboard=False,
                 id=wandb_unique_id,
                 name=experiment_name,
                 resume=True,
