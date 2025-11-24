@@ -122,9 +122,22 @@ class ManipData(Dataset, ABC):
             [data["mano_joints"][t_k][:, None] for t_k in (tip_list)],
             dim=1,
         )
-        tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
-        # tips_contact = tips_near <= 0.008**2  # ? 8mm, ch_dist return square distance
+        tips_near, _, tips_obj_idx, _ = self.ch_dist(tips, obj_verts_transf)
+        tips_contact = tips_near <= 0.008**2  # ? 8mm, ch_dist return square distance
+        closest_points = torch.gather(
+            obj_verts_transf, 
+            dim=1, 
+            index=tips_obj_idx.unsqueeze(-1).expand(-1, -1, 3)
+        )
+
         data["tips_distance"] = torch.sqrt(tips_near)
+        data["tips_contact"] = tips_contact
+        data["closest_obj_point"] = closest_points
+        data["tip_point"] = tips
+        tips_contact_mask = tips_contact.unsqueeze(-1) 
+        data["tip_contact_point"] = torch.where(tips_contact_mask, tips, torch.zeros_like(tips))
+        data["obj_contact_point"] = torch.where(tips_contact_mask, closest_points, torch.zeros_like(closest_points))
+        data["obj_verts_transf"] = obj_verts_transf
 
         data["obj_velocity"] = self.compute_velocity(
             data["obj_trajectory"][:, None, :3, 3], 1 / (120 / self.skip), guassian_filter=True

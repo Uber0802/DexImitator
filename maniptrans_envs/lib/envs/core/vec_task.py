@@ -149,6 +149,15 @@ class Env(ABC):
                     ),
                 }
             )
+        obs_space.update(
+            {
+                "extra": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(30,),
+                ),
+            }
+        )
         self.obs_space = spaces.Dict(obs_space)
 
         self.num_actions = config["env"]["numActions"]
@@ -406,6 +415,15 @@ class VecTask(Env):
                 {
                     "privileged": torch.zeros(
                         (self.num_envs, self.privileged_obs_dim),
+                        device=self.device,
+                        dtype=torch.float,
+                    ),
+                }
+            )
+        self.obs_dict.update(
+                {
+                    "extra": torch.zeros(
+                        (self.num_envs, 30),
                         device=self.device,
                         dtype=torch.float,
                     ),

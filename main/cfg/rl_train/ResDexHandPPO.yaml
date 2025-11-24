@@ -32,15 +32,18 @@ params:
     dict_feature_encoder:
       _target_: lib.nn.features.SimpleFeatureFusion
       extractors:
-        privileged:
+        # privileged:
+        #   _target_: lib.nn.features.Identity
+        #   input_dim: ${is_united_model:${.......bimanual_mode},${.......side},${eval:'${.....base_privileged_dim}+13+5*4+3+1'}}
+        # proprioception:
+        #   _target_: lib.nn.features.Identity
+        #   input_dim: ${is_united_model:${.......bimanual_mode},${.......side},${.....base_proprioception_dim}}
+        # target:
+        #   _target_: lib.nn.features.Identity
+        #   input_dim: ${is_united_model:${.......bimanual_mode},${.......side},${eval:'${.....base_target_dim}+3+3+3+4+4+3+3+${nbody:${.....dexhand}}+5+128'}}
+        extra:
           _target_: lib.nn.features.Identity
-          input_dim: ${is_united_model:${.......bimanual_mode},${.......side},${eval:'${.....base_privileged_dim}+13+5*4+3+1'}}
-        proprioception:
-          _target_: lib.nn.features.Identity
-          input_dim: ${is_united_model:${.......bimanual_mode},${.......side},${.....base_proprioception_dim}}
-        target:
-          _target_: lib.nn.features.Identity
-          input_dim: ${is_united_model:${.......bimanual_mode},${.......side},${eval:'${.....base_target_dim}+3+3+3+4+4+3+3+${nbody:${.....dexhand}}+5+128'}}
+          input_dim: ${eval:'30'}
       hidden_depth: 3
       hidden_dim: 512
       output_dim: 256

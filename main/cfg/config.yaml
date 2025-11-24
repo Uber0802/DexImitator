@@ -75,8 +75,8 @@ multi_gpu: False
 wandb_activate: False
 wandb_group: ''
 wandb_name: ${rl_train.params.config.name}
-wandb_entity: null  # set to your wandb entity if using wandb
-wandb_project: null  # set to your wandb project if using wandb
+wandb_entity:  "b11902127-ntu" # set to your wandb entity if using wandb
+wandb_project: "DexImitator_test"  # set to your wandb project if using wandb
 wandb_tags: []
 wandb_logcode_dir: '' 
 

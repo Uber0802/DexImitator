@@ -55,6 +55,10 @@ class DexHandManipBiHEnv(VecTask):
         self._record = record
         self.cfg = cfg
 
+        self.camera_handlers = []   
+        self.cameras = []  
+        self.visualize = True
+
         use_quat_rot = self.use_quat_rot = self.cfg["env"]["useQuatRot"]
         self.max_episode_length = self.cfg["env"]["episodeLength"]
         self.action_scale = self.cfg["env"]["actionScale"]
@@ -200,10 +204,13 @@ class DexHandManipBiHEnv(VecTask):
         self.obj_bps_lh = self.bps_layer.encode(obj_verts_lh, feature_type=self.bps_feat_type)[self.bps_feat_type]
 
         # Reset all environments
+        self.ct = 0
+        self.step_ct = 0
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
 
         # Refresh tensors
         self._refresh()
+        
 
     def create_sim(self):
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
@@ -454,13 +461,16 @@ class DexHandManipBiHEnv(VecTask):
                 self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
 
             # camera handler for view rendering
-            if self.camera_handlers is not None:
-                self.camera_handlers.append(
-                    self.create_camera(
-                        env=env_ptr,
-                        isaac_gym=self.gym,
-                    )
-                )
+            # if self.camera_handlers is not None:
+            #     self.camera_handlers.append(
+            #         self.create_camera(
+            #             env=env_ptr,
+            #             isaac_gym=self.gym,
+            #         )
+            #     )
+            if self.visualize:
+                cam = self.create_camera(env=env_ptr, isaac_gym=self.gym)
+                self.cameras.append(cam)
 
             # Create dexhand_r
             dexhand_rh_actor = self.gym.create_actor(
@@ -538,6 +548,58 @@ class DexHandManipBiHEnv(VecTask):
 
         # Setup data
         self.init_data()
+
+    def _grab_rgb_images(self, device="gpu", cameras=None):
+        rgb_images = []
+        cams = self.cameras if cameras is None else cameras
+        # NEW: ensure correct render order for multi-env seg
+        self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
+
+        self.gym.render_all_camera_sensors(self.sim)
+        self.gym.start_access_image_tensors(self.sim)
+        try:
+            for env_ptr, cam in zip(self.envs, cams):
+                if device == "gpu":
+                    rgb_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam, gymapi.IMAGE_COLOR)
+                    rgb = gymtorch.wrap_tensor(rgb_tensor)  # (H,W,4) or (4,H,W)
+                    if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                        pass  # (H,W,4)
+                    elif rgb.ndim == 3 and rgb.shape[0] == 4:
+                        rgb = rgb.permute(1, 2, 0)
+                    rgb_images.append(rgb.to(self.sim_device))
+                else:
+                    rgb_np = self.gym.get_camera_image(self.sim, env_ptr, cam, gymapi.IMAGE_COLOR)
+                    rgb = torch.from_numpy(rgb_np.astype(np.uint8))
+                    rgb_images.append(rgb.to(self.sim_device))
+        finally:
+            self.gym.end_access_image_tensors(self.sim)
+        return rgb_images
+
+    def _save_rgb_preview_png(self, out_dir: str, step: int, max_envs: int = 4):
+        import os
+        from PIL import Image
+        imgs = self.last_rgb_images 
+        if imgs is None:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        num = min(len(imgs), max_envs)
+        for i in range(num):
+            rgb = imgs[i].detach().cpu()
+            if rgb.dtype != torch.uint8:
+                rgb = rgb.clamp(0, 255).to(torch.uint8)
+            if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                rgb = rgb[..., :3]
+            elif rgb.ndim == 3 and rgb.shape[0] == 4:
+                rgb = rgb.permute(1, 2, 0)[..., :3]
+            Image.fromarray(rgb.numpy(), mode="RGB").save(
+                os.path.join(out_dir, f"rgb_env{i:02d}_step{step:06d}.png")
+            )
+
+    def _render_all_cameras(self):
+        self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
+        self.gym.render_all_camera_sensors(self.sim)
 
     def init_data(self):
         # Setup sim handles
@@ -983,6 +1045,23 @@ class DexHandManipBiHEnv(VecTask):
             **{"lh_" + k: v for k, v in lh_reward_dict.items()},
         }
 
+    def compute_reward_tip(self, actions):
+        lh_rew_buf, lh_reset_buf, lh_success_buf, lh_failure_buf, lh_reward_dict, lh_error_buf = (
+            self.compute_reward_side_tip(actions, side="lh")
+        )
+        rh_rew_buf, rh_reset_buf, rh_success_buf, rh_failure_buf, rh_reward_dict, rh_error_buf = (
+            self.compute_reward_side_tip(actions, side="rh")
+        )
+        self.rew_buf = rh_rew_buf + lh_rew_buf
+        self.reset_buf = rh_reset_buf | lh_reset_buf
+        self.success_buf = rh_success_buf & lh_success_buf
+        self.failure_buf = rh_failure_buf | lh_failure_buf
+        self.error_buf = rh_error_buf | lh_error_buf
+        self.reward_dict = {
+            **{"rh_" + k: v for k, v in rh_reward_dict.items()},
+            **{"lh_" + k: v for k, v in lh_reward_dict.items()},
+        }
+
     def compute_reward_side(self, actions, side="rh"):
         side_demo_data = self.demo_data_rh if side == "rh" else self.demo_data_lh
         target_state = {}
@@ -997,6 +1076,12 @@ class DexHandManipBiHEnv(VecTask):
         target_state["wrist_ang_vel"] = side_demo_data["wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx]
 
         target_state["tips_distance"] = side_demo_data["tips_distance"][torch.arange(self.num_envs), cur_idx]
+        target_state["tips_contact"] = side_demo_data["tips_contact"][torch.arange(self.num_envs), cur_idx]
+        target_state["closest_obj_point"] = side_demo_data["closest_obj_point"][torch.arange(self.num_envs), cur_idx]
+        target_state["tip_point"] = side_demo_data["tip_point"][torch.arange(self.num_envs), cur_idx]
+        target_state["tip_contact_point"] = side_demo_data["tip_contact_point"][torch.arange(self.num_envs), cur_idx]
+        target_state["obj_contact_point"] = side_demo_data["obj_contact_point"][torch.arange(self.num_envs), cur_idx]
+        
 
         cur_joints_pos = side_demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx]
         target_state["joints_pos"] = cur_joints_pos.reshape(self.num_envs, -1, 3)
@@ -1081,12 +1166,137 @@ class DexHandManipBiHEnv(VecTask):
         else:
             scale_factor = 1.0
 
-        assert not self.headless or isinstance(compute_imitation_reward, torch.jit.ScriptFunction)
+        # assert not self.headless or isinstance(compute_imitation_reward, torch.jit.ScriptFunction)
 
         if self.rollout_len is not None:
             max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
 
         rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf = compute_imitation_reward(
+            self.reset_buf,
+            self.progress_buf,
+            self.running_progress_buf,
+            self.actions,
+            side_states,
+            target_state,
+            max_length,
+            scale_factor,
+            (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
+        )
+        self.total_rew_buf += rew_buf
+        return rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf
+
+    def compute_reward_side_tip(self, actions, side="rh"):
+        side_demo_data = self.demo_data_rh if side == "rh" else self.demo_data_lh
+        target_state = {}
+        max_length = torch.clip(side_demo_data["seq_len"], 0, self.max_episode_length).float()
+        cur_idx = self.progress_buf
+        cur_wrist_pos = side_demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_pos"] = cur_wrist_pos
+        cur_wrist_rot = side_demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_quat"] = aa_to_quat(cur_wrist_rot)[:, [1, 2, 3, 0]]
+
+        target_state["wrist_vel"] = side_demo_data["wrist_velocity"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_ang_vel"] = side_demo_data["wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx]
+
+        target_state["tips_distance"] = side_demo_data["tips_distance"][torch.arange(self.num_envs), cur_idx]
+        target_state["tips_contact"] = side_demo_data["tips_contact"][torch.arange(self.num_envs), cur_idx]
+        target_state["closest_obj_point"] = side_demo_data["closest_obj_point"][torch.arange(self.num_envs), cur_idx]
+        target_state["tip_point"] = side_demo_data["tip_point"][torch.arange(self.num_envs), cur_idx]
+        target_state["tip_contact_point"] = side_demo_data["tip_contact_point"][torch.arange(self.num_envs), cur_idx]
+        target_state["obj_contact_point"] = side_demo_data["obj_contact_point"][torch.arange(self.num_envs), cur_idx]
+        target_state["obj_verts_transf"] = side_demo_data["obj_verts_transf"][torch.arange(self.num_envs), cur_idx]
+
+        
+
+        cur_joints_pos = side_demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx]
+        target_state["joints_pos"] = cur_joints_pos.reshape(self.num_envs, -1, 3)
+        target_state["joints_vel"] = side_demo_data["mano_joints_velocity"][
+            torch.arange(self.num_envs), cur_idx
+        ].reshape(self.num_envs, -1, 3)
+
+        cur_obj_transf = side_demo_data["obj_trajectory"][torch.arange(self.num_envs), cur_idx]
+        target_state["manip_obj_pos"] = cur_obj_transf[:, :3, 3]
+        target_state["manip_obj_quat"] = rotmat_to_quat(cur_obj_transf[:, :3, :3])[:, [1, 2, 3, 0]]
+
+        target_state["manip_obj_vel"] = side_demo_data["obj_velocity"][torch.arange(self.num_envs), cur_idx]
+        target_state["manip_obj_ang_vel"] = side_demo_data["obj_angular_velocity"][torch.arange(self.num_envs), cur_idx]
+
+        target_state["tip_force"] = torch.stack(
+            [
+                self.net_cf[:, getattr(self, f"dexhand_{side}_handles")[k], :]
+                for k in (self.dexhand_rh.contact_body_names if side == "rh" else self.dexhand_lh.contact_body_names)
+            ],
+            axis=1,
+        )
+        setattr(
+            self,
+            f"{side}_tips_contact_history",
+            torch.concat(
+                [
+                    getattr(self, f"{side}_tips_contact_history")[:, 1:],
+                    (torch.norm(target_state["tip_force"], dim=-1) > 0)[:, None],
+                ],
+                dim=1,
+            ),
+        )
+        target_state["tip_contact_state"] = getattr(self, f"{side}_tips_contact_history")
+
+        side_states = getattr(self, f"{side}_states")
+        if side == "rh":
+            power = torch.abs(torch.multiply(self.dof_force[:, : self.dexhand_rh.n_dofs], side_states["dq"])).sum(
+                dim=-1
+            )
+        else:
+            power = torch.abs(torch.multiply(self.dof_force[:, self.dexhand_rh.n_dofs :], side_states["dq"])).sum(
+                dim=-1
+            )
+        target_state["power"] = power
+
+        base_handle = getattr(self, f"dexhand_{side}_handles")[
+            self.dexhand_rh.to_dex("wrist")[0] if side == "rh" else self.dexhand_lh.to_dex("wrist")[0]
+        ]
+
+        wrist_power = torch.abs(
+            torch.sum(
+                self.apply_forces[:, base_handle, :] * side_states["base_state"][:, 7:10],
+                dim=-1,
+            )
+        )  # ? linear force * linear velocity
+        wrist_power += torch.abs(
+            torch.sum(
+                self.apply_torque[:, base_handle, :] * side_states["base_state"][:, 10:],
+                dim=-1,
+            )
+        )  # ? torque * angular velocity
+        target_state["wrist_power"] = wrist_power
+
+        if self.training:
+            last_step = self.gym.get_frame_count(self.sim)
+            if self.tighten_method == "None":
+                scale_factor = 1.0
+            elif self.tighten_method == "const":
+                scale_factor = self.tighten_factor
+            elif self.tighten_method == "linear_decay":
+                scale_factor = 1 - (1 - self.tighten_factor) / self.tighten_steps * min(last_step, self.tighten_steps)
+            elif self.tighten_method == "exp_decay":
+                scale_factor = (np.e * 2) ** (-1 * last_step / self.tighten_steps) * (
+                    1 - self.tighten_factor
+                ) + self.tighten_factor
+            elif self.tighten_method == "cos":
+                scale_factor = (self.tighten_factor) + np.abs(
+                    -1 * (1 - self.tighten_factor) * np.cos(last_step / self.tighten_steps * np.pi)
+                ) * (2 ** (-1 * last_step / self.tighten_steps))
+            else:
+                raise NotImplementedError
+        else:
+            scale_factor = 1.0
+
+        # assert not self.headless or isinstance(compute_imitation_reward_tip, torch.jit.ScriptFunction)
+
+        if self.rollout_len is not None:
+            max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
+
+        rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf = compute_imitation_reward_tip(
             self.reset_buf,
             self.progress_buf,
             self.running_progress_buf,
@@ -1106,6 +1316,19 @@ class DexHandManipBiHEnv(VecTask):
         obs_lh = self.compute_observations_side("lh")
         for k in obs_rh.keys():
             self.obs_dict[k] = torch.cat([obs_rh[k], obs_lh[k]], dim=-1)
+        # import ipdb; ipdb.set_trace()
+        # self.step_ct += 1
+        # print(self.step_ct)
+
+        if self.visualize:
+            self._render_all_cameras()
+            
+
+            self.last_rgb_images = self._grab_rgb_images(device="gpu", cameras=self.cameras)
+            step = int(self.gym.get_frame_count(self.sim))
+            out_dir = "cam_debug"
+            self._save_rgb_preview_png(out_dir, step, max_envs=2)
+    
 
     def compute_observations_side(self, side="rh"):
         # obs_keys: q, cos_q, sin_q, base_state
@@ -1123,6 +1346,8 @@ class DexHandManipBiHEnv(VecTask):
             else:
                 obs_values.append(side_states[ob])
         obs_dict["proprioception"] = torch.cat(obs_values, dim=-1)
+        
+
         # privileged_obs_keys: dq, manip_obj_pos, manip_obj_quat, manip_obj_vel, manip_obj_ang_vel
         if len(self._privileged_obs_keys) > 0:
             pri_obs_values = []
@@ -1159,6 +1384,7 @@ class DexHandManipBiHEnv(VecTask):
             obs_dict["privileged"] = torch.cat(pri_obs_values, dim=-1)
 
         next_target_state = {}
+        extra_state = {}
 
         cur_idx = self.progress_buf + 1
         cur_idx = torch.clamp(cur_idx, torch.zeros_like(side_demo_data["seq_len"]), side_demo_data["seq_len"] - 1)
@@ -1170,6 +1396,9 @@ class DexHandManipBiHEnv(VecTask):
         nF = self.obs_future_length
 
         def indicing(data, idx):
+            # print("data.shape:", data.shape)
+            # print("nE:", nE)
+            # print("nT:", nT)
             assert data.shape[0] == nE and data.shape[1] == nT
             remaining_shape = data.shape[2:]
             expanded_idx = idx
@@ -1267,6 +1496,28 @@ class DexHandManipBiHEnv(VecTask):
                     "bps",
                 ]
             ],
+            dim=-1,
+        )
+        extra_state["tips_contact"] = indicing(side_demo_data["tips_contact"], cur_idx).squeeze(1).flatten(start_dim=1)    
+        extra_state["closest_obj_point"] = indicing(side_demo_data["closest_obj_point"], cur_idx).squeeze(1).flatten(start_dim=1)    
+        extra_state["tip_point"] = indicing(side_demo_data["tip_point"], cur_idx).squeeze(1).flatten(start_dim=1)    
+        extra_state["tip_contact_point"] = indicing(side_demo_data["tip_contact_point"], cur_idx).squeeze(1).flatten(start_dim=1)    
+        extra_state["obj_contact_point"] = indicing(side_demo_data["obj_contact_point"], cur_idx).squeeze(1).flatten(start_dim=1)  
+        joint_idx = (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx  
+        tip_indices = joint_idx["thumb_tip"] + joint_idx["index_tip"] + joint_idx["middle_tip"] + joint_idx["ring_tip"] + joint_idx["pinky_tip"]
+        joint_pos = side_states["joints_state"][:, :, :3]
+        tip_pos = joint_pos[:, tip_indices, :].squeeze(1).flatten(start_dim=1)  
+        # obs_dict["extra"] = torch.cat(
+        #     [tip_pos] + [extra_state[ob] for ob in [
+        #         "tip_point",
+        #         "tip_contact_point",
+        #         "obj_contact_point",
+        #     ]],
+        #     dim=-1,
+        # )
+        # import ipdb; ipdb.set_trace()
+        obs_dict["extra"] = torch.cat(
+            [tip_pos - extra_state["obj_contact_point"]] ,
             dim=-1,
         )
 
@@ -1459,7 +1710,53 @@ class DexHandManipBiHEnv(VecTask):
         self._refresh()
         if self.randomize:
             self.apply_randomizations(self.dr_randomizations)
+        
+        import subprocess
+        import os
+        import glob
 
+        if self.visualize:
+            cam_dir = "./cam_debug"
+            os.makedirs(cam_dir, exist_ok=True)
+
+            self.ct += 1
+
+            for env_id in env_ids.tolist():
+                env_tag = f"env{env_id:02d}"
+                ct_suffix = f"_ct{int(self.ct)}"
+                output_path = os.path.join(cam_dir, f"debug_video_{env_tag}{ct_suffix}.mp4")
+
+                # 絕對 glob
+                pattern = os.path.join(cam_dir, f"rgb_env{env_id:02d}_step*.png")
+
+                png_files = sorted(glob.glob(pattern))
+
+                if png_files:
+                    print(f"🎥 [env {env_id}] Creating video from {len(png_files)} frames ...")
+
+                    try:
+                        subprocess.run([
+                            "ffmpeg", "-y",
+                            "-framerate", "30",
+                            "-pattern_type", "glob",
+                            "-i", pattern,
+                            "-c:v", "libx264",
+                            "-pix_fmt", "yuv420p",
+                            output_path
+                        ], check=True)
+
+                        print(f"✅ [env {env_id}] Saved video: {output_path}")
+
+                        for f in png_files:
+                            os.remove(f)
+
+                        print(f"🧹 [env {env_id}] Deleted {len(png_files)} PNGs.")
+
+                    except Exception as e:
+                        print(f"❌ [env {env_id}] ffmpeg error: {e}")
+
+
+        # # ----------- 其餘原始邏輯 -----------
         last_step = self.gym.get_frame_count(self.sim)
         if self.training and len(self.dataIndices) == 1 and last_step >= self.tighten_steps:
             running_steps = self.running_progress_buf[env_ids] - 1
@@ -1758,7 +2055,7 @@ class DexHandManipBiHEnv(VecTask):
     def post_physics_step(self):
 
         self.compute_observations()
-        self.compute_reward(self.actions)
+        self.compute_reward_tip(self.actions)
 
         self.progress_buf += 1
         self.running_progress_buf += 1
@@ -2023,6 +2320,229 @@ def compute_imitation_reward(
         "reward_power": reward_power,
         "reward_wrist_power": reward_wrist_power,
         "reward_finger_tip_force": reward_finger_tip_force,
+    }
+
+    return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
+
+# @torch.jit.script
+def compute_imitation_reward_tip(
+    reset_buf: Tensor,
+    progress_buf: Tensor,
+    running_progress_buf: Tensor,
+    actions: Tensor,
+    states: Dict[str, Tensor],
+    target_states: Dict[str, Tensor],
+    max_length: List[int],
+    scale_factor: float,
+    dexhand_weight_idx: Dict[str, List[int]],
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]]) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
+
+    # end effector pose reward
+    current_eef_pos = states["base_state"][:, :3]
+    current_eef_quat = states["base_state"][:, 3:7]
+
+    target_eef_pos = target_states["wrist_pos"]
+    target_eef_quat = target_states["wrist_quat"]
+    diff_eef_pos = target_eef_pos - current_eef_pos
+    diff_eef_pos_dist = torch.norm(diff_eef_pos, dim=-1)
+
+    current_eef_vel = states["base_state"][:, 7:10]
+    current_eef_ang_vel = states["base_state"][:, 10:13]
+    target_eef_vel = target_states["wrist_vel"]
+    target_eef_ang_vel = target_states["wrist_ang_vel"]
+
+    diff_eef_vel = target_eef_vel - current_eef_vel
+    diff_eef_ang_vel = target_eef_ang_vel - current_eef_ang_vel
+
+    joints_pos = states["joints_state"][:, 1:, :3]
+    target_joints_pos = target_states["joints_pos"]
+    diff_joints_pos = target_joints_pos - joints_pos
+    diff_joints_pos_dist = torch.norm(diff_joints_pos, dim=-1)
+
+    # ? assign different weights to different joints
+    # assert diff_joints_pos_dist.shape[1] == 17  # ignore the base joint
+    diff_thumb_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["thumb_tip"]]].mean(dim=-1)
+    diff_index_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["index_tip"]]].mean(dim=-1)
+    diff_middle_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["middle_tip"]]].mean(dim=-1)
+    diff_ring_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["ring_tip"]]].mean(dim=-1)
+    diff_pinky_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["pinky_tip"]]].mean(dim=-1)
+    diff_level_1_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["level_1_joints"]]].mean(dim=-1)
+    diff_level_2_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["level_2_joints"]]].mean(dim=-1)
+
+    joints_vel = states["joints_state"][:, 1:, 7:10]
+    target_joints_vel = target_states["joints_vel"]
+    diff_joints_vel = target_joints_vel - joints_vel
+
+    reward_eef_pos = torch.exp(-40 * diff_eef_pos_dist)
+    reward_thumb_tip_pos = torch.exp(-100 * diff_thumb_tip_pos_dist)
+    reward_index_tip_pos = torch.exp(-90 * diff_index_tip_pos_dist)
+    reward_middle_tip_pos = torch.exp(-80 * diff_middle_tip_pos_dist)
+    reward_pinky_tip_pos = torch.exp(-60 * diff_pinky_tip_pos_dist)
+    reward_ring_tip_pos = torch.exp(-60 * diff_ring_tip_pos_dist)
+    reward_level_1_pos = torch.exp(-50 * diff_level_1_pos_dist)
+    reward_level_2_pos = torch.exp(-40 * diff_level_2_pos_dist)
+
+    reward_eef_vel = torch.exp(-1 * diff_eef_vel.abs().mean(dim=-1))
+    reward_eef_ang_vel = torch.exp(-1 * diff_eef_ang_vel.abs().mean(dim=-1))
+    reward_joints_vel = torch.exp(-1 * diff_joints_vel.abs().mean(dim=-1).mean(-1))
+
+    current_dof_vel = states["dq"]
+
+    diff_eef_rot = quat_mul(target_eef_quat, quat_conjugate(current_eef_quat))
+    diff_eef_rot_angle = quat_to_angle_axis(diff_eef_rot)[0]
+    reward_eef_rot = torch.exp(-1 * (diff_eef_rot_angle).abs())
+
+    # object pose reward
+    current_obj_pos = states["manip_obj_pos"]
+    current_obj_quat = states["manip_obj_quat"]
+
+    target_obj_pos = target_states["manip_obj_pos"]
+    target_obj_quat = target_states["manip_obj_quat"]
+    diff_obj_pos = target_obj_pos - current_obj_pos
+    diff_obj_pos_dist = torch.norm(diff_obj_pos, dim=-1)
+
+    reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
+
+    diff_obj_rot = quat_mul(target_obj_quat, quat_conjugate(current_obj_quat))
+    diff_obj_rot_angle = quat_to_angle_axis(diff_obj_rot)[0]
+    reward_obj_rot = torch.exp(-3 * (diff_obj_rot_angle).abs())
+
+    current_obj_vel = states["manip_obj_vel"]
+    target_obj_vel = target_states["manip_obj_vel"]
+    diff_obj_vel = target_obj_vel - current_obj_vel
+    reward_obj_vel = torch.exp(-1 * diff_obj_vel.abs().mean(dim=-1))
+
+    current_obj_ang_vel = states["manip_obj_ang_vel"]
+    target_obj_ang_vel = target_states["manip_obj_ang_vel"]
+    diff_obj_ang_vel = target_obj_ang_vel - current_obj_ang_vel
+    reward_obj_ang_vel = torch.exp(-1 * diff_obj_ang_vel.abs().mean(dim=-1))
+
+    reward_power = torch.exp(-10 * target_states["power"])
+    reward_wrist_power = torch.exp(-2 * target_states["wrist_power"])
+
+    finger_tip_force = target_states["tip_force"]
+    finger_tip_distance = target_states["tips_distance"]
+    contact_range = [0.02, 0.03]
+    finger_tip_weight = torch.clamp(
+        (contact_range[1] - finger_tip_distance) / (contact_range[1] - contact_range[0]), 0, 1
+    )
+    finger_tip_force_masked = finger_tip_force * finger_tip_weight[:, :, None]
+
+    reward_finger_tip_force = torch.exp(-1 * (1 / (torch.norm(finger_tip_force_masked, dim=-1).sum(-1) + 1e-5)))
+
+    tip_contact_mask = target_states["tips_contact"]
+    closest_obj_point = target_states["closest_obj_point"]
+    tip_point = target_states["tip_point"]
+    tip_contact_point = target_states["tip_contact_point"]
+    obj_contact_point = target_states["obj_contact_point"]
+    tip_contact_distance = torch.where(tip_contact_mask, finger_tip_distance, torch.zeros_like(finger_tip_distance))
+    obj_verts_transf = target_states["obj_verts_transf"]
+
+    
+    tip_indices = dexhand_weight_idx["thumb_tip"] + dexhand_weight_idx["index_tip"] + dexhand_weight_idx["middle_tip"] + dexhand_weight_idx["ring_tip"] + dexhand_weight_idx["pinky_tip"]
+    joint_pos = states["joints_state"][:, :, :3]
+    tip_pos = joint_pos[:, tip_indices, :].squeeze(1)
+
+    import chamfer_distance as chd
+    ch_dist = chd.ChamferDistance()
+    tips_near, _, tips_obj_idx, _ = ch_dist(tip_pos, obj_verts_transf)
+    cur_finger_tip_distance = torch.sqrt(tips_near)
+
+    tip_obj_sq_dist = ((tip_pos - obj_contact_point) ** 2).sum(dim=-1)
+    tip_obj_dist = torch.sqrt(tip_obj_sq_dist)
+    tip_obj_dist_masked = tip_obj_dist * tip_contact_mask.float()
+
+
+    reward_per_tip = torch.exp(-100 * tip_obj_dist_masked)
+    reward_per_tip = reward_per_tip * (tip_obj_dist_masked > 0)
+    reward_tip_contact = reward_per_tip.sum(dim=-1)
+
+    # import ipdb; ipdb.set_trace()
+
+
+
+    error_buf = (
+        (torch.norm(current_eef_vel, dim=-1) > 100)
+        | (torch.norm(current_eef_ang_vel, dim=-1) > 200)
+        | (torch.norm(joints_vel, dim=-1).mean(-1) > 100)
+        | (torch.abs(current_dof_vel).mean(-1) > 200)
+        | (torch.norm(current_obj_vel, dim=-1) > 100)
+        | (torch.norm(current_obj_ang_vel, dim=-1) > 200)
+    )  # sanity check
+
+
+    failed_execute = (
+        (
+            # (diff_obj_pos_dist > 0.02 / 0.343 * scale_factor**3)  # TODO
+            # | (diff_thumb_tip_pos_dist > 0.04 / 0.7 * scale_factor)
+            # | (diff_index_tip_pos_dist > 0.045 / 0.7 * scale_factor)
+            # | (diff_middle_tip_pos_dist > 0.05 / 0.7 * scale_factor)
+            # | (diff_pinky_tip_pos_dist > 0.06 / 0.7 * scale_factor)
+            # | (diff_ring_tip_pos_dist > 0.06 / 0.7 * scale_factor)
+            # | (diff_level_1_pos_dist > 0.07 / 0.7 * scale_factor)
+            # | (diff_level_2_pos_dist > 0.08 / 0.7 * scale_factor)
+            # | (diff_obj_rot_angle.abs() / np.pi * 180 > 30 / 0.343 * scale_factor**3)  # TODO
+            torch.any((finger_tip_distance < 0.005) & ~(target_states["tip_contact_state"].any(1)), dim=-1)
+            | (tip_obj_dist_masked.sum(1) > 0.05)
+        )
+        & (running_progress_buf >= 8)
+    ) | error_buf
+    reward_execute = (
+        # 0.1 * reward_eef_pos
+        # + 0.6 * reward_eef_rot
+        # + 0.9 * reward_thumb_tip_pos
+        # + 0.8 * reward_index_tip_pos
+        # + 0.75 * reward_middle_tip_pos
+        # + 0.6 * reward_pinky_tip_pos
+        # + 0.6 * reward_ring_tip_pos
+        # + 0.5 * reward_level_1_pos
+        # + 0.3 * reward_level_2_pos
+        # + 5.0 * reward_obj_pos
+        # + 1.0 * reward_obj_rot
+        # + 0.1 * reward_eef_vel
+        # + 0.05 * reward_eef_ang_vel
+        # + 0.1 * reward_joints_vel
+        # + 0.1 * reward_obj_vel
+        # + 0.1 * reward_obj_ang_vel
+        # + 1.0 * reward_finger_tip_force
+        # + 0.5 * reward_power
+        # + 0.5 * reward_wrist_power
+        5 * reward_tip_contact
+    )
+
+    succeeded = (
+        progress_buf + 1 + 3 >= max_length
+    ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
+    reset_buf = torch.where(
+        succeeded | failed_execute,
+        torch.ones_like(reset_buf),
+        reset_buf,
+    )
+    reward_dict = {
+        "reward_eef_pos": reward_eef_pos,
+        "reward_eef_rot": reward_eef_rot,
+        "reward_eef_vel": reward_eef_vel,
+        "reward_eef_ang_vel": reward_eef_ang_vel,
+        "reward_joints_vel": reward_joints_vel,
+        "reward_obj_pos": reward_obj_pos,
+        "reward_obj_rot": reward_obj_rot,
+        "reward_obj_vel": reward_obj_vel,
+        "reward_obj_ang_vel": reward_obj_ang_vel,
+        "reward_joints_pos": (
+            reward_thumb_tip_pos
+            + reward_index_tip_pos
+            + reward_middle_tip_pos
+            + reward_pinky_tip_pos
+            + reward_ring_tip_pos
+            + reward_level_1_pos
+            + reward_level_2_pos
+        ),
+        "reward_power": reward_power,
+        "reward_wrist_power": reward_wrist_power,
+        "reward_finger_tip_force": reward_finger_tip_force,
+        "reward_tip_contact": reward_tip_contact,
     }
 
     return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
