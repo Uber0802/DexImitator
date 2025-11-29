@@ -112,8 +112,9 @@ class DexHandManipBiHEnv(VecTask):
         self.rollout_len = self.cfg["env"].get("rolloutLen", None)
         self.rollout_begin = self.cfg["env"].get("rolloutBegin", None)
 
-        assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
-        assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
+
+        # assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
+        # assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
 
         # Tensor placeholders
         self._root_state = None  # State of root body        (n_envs, 13)
@@ -262,7 +263,10 @@ class DexHandManipBiHEnv(VecTask):
         mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
         self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
 
+        # import ipdb; ipdb.set_trace()
+
         dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+
 
         self.demo_dataset_lh_dict = {}
         self.demo_dataset_rh_dict = {}
@@ -410,7 +414,7 @@ class DexHandManipBiHEnv(VecTask):
         self.dexhand_ls = []
         self.envs = []
 
-        assert len(self.dataIndices) == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
+        # assert len(self.dataIndices) == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
 
         def segment_data(k, data_dict):
             todo_list = self.dataIndices
@@ -1758,7 +1762,7 @@ class DexHandManipBiHEnv(VecTask):
 
         # # ----------- 其餘原始邏輯 -----------
         last_step = self.gym.get_frame_count(self.sim)
-        if self.training and len(self.dataIndices) == 1 and last_step >= self.tighten_steps:
+        if self.training and last_step >= self.tighten_steps:
             running_steps = self.running_progress_buf[env_ids] - 1
             max_running_steps, max_running_idx = running_steps.max(dim=0)
             max_running_env_id = env_ids[max_running_idx]
